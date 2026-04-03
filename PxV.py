@@ -54,7 +54,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ---------- certificate auth ----------
 try:
     import base64
-    from urllib.parse import urlparse, unquote
+    from urllib.parse import urlparse
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
     _CRYPTO_AVAILABLE = True
@@ -88,11 +88,7 @@ class APICCertAuth(AuthBase):
 
     def __call__(self, r):
         parsed = urlparse(r.url)
-        # URL-decode the path so the signature payload matches what APIC
-        # computes on its side (APIC normalises %-encoded chars like %7C → |
-        # before verifying).  requests encodes | as %7C in the order-by param;
-        # signing the encoded form produces a mismatch and a 403.
-        path = unquote(parsed.path + (f"?{parsed.query}" if parsed.query else ""))
+        path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
         body = r.body or ""
         if isinstance(body, bytes):
             body = body.decode("utf-8")
@@ -288,7 +284,7 @@ class APIC:
             r.raise_for_status()
         raise RuntimeError("Repeated authentication failures while accessing APIC.")
 
-    def class_query_all(self, cls, query_params=None, order_by_dn=True):
+    def class_query_all(self, cls, query_params=None):
         out = []
         page = 0
         while True:
@@ -296,8 +292,6 @@ class APIC:
             params = {"page-size": self.page_size, "page": page}
             if query_params:
                 params.update(query_params)
-            if order_by_dn:
-                params["order-by"] = f"{cls}.dn|asc"
             r = self._request_with_reauth("GET", u, params=params, verify=self.verify, timeout=self.timeout)
             r.raise_for_status()
             data = r.json()
@@ -313,7 +307,7 @@ class APIC:
         page = 0
         while True:
             url = f"{self.url}/api/class/{cls}.json"
-            params = {"page-size": self.page_size, "page": page, "order-by": f"{cls}.dn|asc"}
+            params = {"page-size": self.page_size, "page": page}
             r = self._request_with_reauth("GET", url, params=params, verify=self.verify, timeout=self.timeout)
             r.raise_for_status()
             rows = r.json().get("imdata") or []  # FIX #12
