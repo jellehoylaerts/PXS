@@ -86,14 +86,19 @@ class APICCertAuth(AuthBase):
         return base64.b64encode(sig).decode("utf-8")
 
     def __call__(self, r):
+        # path_url is the raw path + query string as sent in the HTTP request
+        # line (e.g. /api/class/fvBD.json?page-size=1000&...).  Using r.url
+        # directly would include scheme+host which APIC does not sign against.
         parsed = urlparse(r.url)
         path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
         body = r.body or ""
         if isinstance(body, bytes):
             body = body.decode("utf-8")
         sig = self._sign(r.method, path, body)
-        r.headers["Cookie"] = ""   # no session cookie for cert auth
-        r.headers["APIC-request-signature"]    = sig
+        # APIC requires Cookie: APIC-cookie=<cert_dn> (not empty) to identify
+        # which certificate to verify the signature against.
+        r.headers["Cookie"] = f"APIC-cookie={self.cert_dn}"
+        r.headers["APIC-request-signature"]     = sig
         r.headers["APIC-certificate-algorithm"] = "v1.0"
         r.headers["APIC-certificate-dn"]        = self.cert_dn
         r.headers["APIC-certificate-fingerprint"] = "fingerprint"
