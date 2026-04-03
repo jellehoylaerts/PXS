@@ -281,6 +281,12 @@ class APIC:
                 print("⚠️  APIC session expired — performing re-login...")
                 self.login()
                 continue
+            # Print APIC error body before raising so the user can see why it failed
+            try:
+                err = r.json().get("imdata", [{}])[0].get("error", {}).get("attributes", {})
+                print(f"  [APIC ERROR] code={err.get('code')} text={err.get('text')!r}")
+            except Exception:
+                print(f"  [APIC ERROR] body={r.text[:200]!r}")
             r.raise_for_status()
         raise RuntimeError("Repeated authentication failures while accessing APIC.")
 
@@ -1100,6 +1106,11 @@ def parse_args():
                    help="Name of the certificate registered in APIC under the user account "
                         "(e.g. 'admin' → DN: uni/userext/user-{user}/usercert-{cert-name}). "
                         "Defaults to the username when --key is used.")
+    p.add_argument("--cert-dn", default=os.getenv("APIC_CERT_DN"),
+                   help="Full DN of the certificate object in APIC "
+                        "(e.g. uni/userext/user-admin/usercert-admin). "
+                        "Overrides the DN computed from --user and --cert-name. "
+                        "Run 'moquery -c aaaUserCert' on APIC to find the exact DN.")
     p.add_argument("--prompt-password", action="store_true",
                    help="Prompt interactively for a password instead of using certificate auth.")
     p.add_argument("--verify", action="store_true")
@@ -1158,8 +1169,11 @@ def main():
     # Build auth: certificate takes priority over password
     cert_auth = None
     if key_file:
-        cert_name = a.cert_name or user   # default cert name = username
-        cert_dn = f"uni/userext/user-{user}/usercert-{cert_name}"
+        if a.cert_dn:
+            cert_dn = a.cert_dn
+        else:
+            cert_name = a.cert_name or user   # default cert name = username
+            cert_dn = f"uni/userext/user-{user}/usercert-{cert_name}"
         try:
             cert_auth = APICCertAuth(cert_dn, key_file, debug=a.http_log)
             print(f"Using certificate authentication (cert DN: {cert_dn})")
