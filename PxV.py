@@ -976,42 +976,21 @@ def compute(api, api_data, acc_tree, node_tree, static_pxv, totals_only, ports_o
     return leafs, static_pxv, aaep_pxv, hw_stats
 
 # ---------- output ----------
-def build_json(leafs, static_pxv, aaep_pxv, hw_stats, totals_only, pxv_limit):
-    # Pre-group for O(1) per-node lookup
-    aaep_by_node = defaultdict(dict)
-    for (n, iface), vlans in aaep_pxv.items():
-        aaep_by_node[n][iface] = vlans
-
+def build_json(leafs, hw_stats, pxv_limit):
     out = {"nodes": {}}
     for node, host in leafs.items():
-        ne = {"hostname": host}
-        node_aaep = aaep_by_node.get(node, {})
-        ifaces = set(static_pxv.get(node, {}).keys()) | set(node_aaep.keys())
-        st = at = ut = 0
-        if not totals_only: ne["interfaces"] = {}
-        for iface in sorted(ifaces, key=if_sort_key):
-            s = static_pxv.get(node, {}).get(iface, set())
-            a = node_aaep.get(iface, set())
-            u = s | a
-            st += len(s); at += len(a); ut += len(u)
-            if not totals_only:
-                ne["interfaces"][iface] = {
-                    "static": sorted(s), "static_count": len(s),
-                    "aaep": sorted(a), "aaep_count": len(a),
-                    "union": sorted(u), "union_count": len(u)
-                }
-        ne["totals"] = {"static_total": st, "aaep_total": at, "union_total": ut}
         hw = hw_stats.get(node, {"ports_used": 0, "l2_bds": 0, "l3_bds": 0, "pxv_value": 0})
-        ne["hardware_pxv"] = {
-            "ports_used": hw["ports_used"],
-            "l2_bds": hw["l2_bds"],
-            "l3_bds": hw["l3_bds"],
-            "pxv_value": hw["pxv_value"],
-            "limit": pxv_limit,
-            "within_limit": hw["pxv_value"] <= pxv_limit,
-            "note": "PxV = SUM_over_ports( L2 + 2×L3 )  (strict per-port calculation)"
+        out["nodes"][node] = {
+            "hostname": host,
+            "hardware_pxv": {
+                "ports_used": hw["ports_used"],
+                "l2_bds": hw["l2_bds"],
+                "l3_bds": hw["l3_bds"],
+                "pxv_value": hw["pxv_value"],
+                "limit": pxv_limit,
+                "within_limit": hw["pxv_value"] <= pxv_limit,
+            },
         }
-        out["nodes"][node] = ne
     return out
 
 def print_text(leafs, static_pxv, aaep_pxv, hw_stats, totals_only, pxv_limit):
@@ -1196,7 +1175,7 @@ def main():
     )
 
     if a.json:
-        print(json.dumps(build_json(leafs, static_pxv, aaep_pxv, hw_stats, a.totals_only, a.pxv_limit), indent=2))
+        print(json.dumps(build_json(leafs, hw_stats, a.pxv_limit), indent=2))
     else:
         print_text(leafs, static_pxv, aaep_pxv, hw_stats, a.totals_only, a.pxv_limit)
 
