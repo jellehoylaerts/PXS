@@ -8,11 +8,10 @@ ACI PxV - Single-file full rewrite (optimized)
 - Uses separate thread pools for class scans and subtree fetches.
 - Preserves original CLI interface and output format.
 - BD L2/L3 classification for PxV weight:
-    * L2 BD (weight=1): unicastRoute=disabled AND no subnets configured.
-    * L3 BD (weight=2): everything else (routing enabled, subnets present,
-      or unicastRoute unset/unknown).
-    * Flood-mode attributes (unkMacUcastAct, arpFlood, multiDstPktAct) do
-      NOT affect the PxV weight — they describe flood behaviour only.
+    * L2 BD (weight=1): BD has an fvAccP child object (Cisco legacy mode).
+    * L3 BD (weight=2): everything else (no fvAccP present).
+    * fvAccP is only created when a BD is explicitly placed in legacy/L2 mode;
+      unicastRoute and flood-mode attributes are NOT used for classification.
 
 FIXES (April 2026):
 - Fix #1:  collect_static_from_epgs: only process direct fvRsPathAtt children,
@@ -613,62 +612,43 @@ def vlan_to_bd(api_data):
     return m
 
 def bd_l3_map(api_data, debug=False):
-    FALSE = {"no", "false", "disabled", "off", "0"}
+    """
+    Classify each BD as L2 (weight=1) or L3 (weight=2) for PxV calculation.
 
-    def norm(v: str) -> str:
-        return (v or "").strip().lower()
+    The authoritative indicator is the presence of an fvAccP child object
+    under the BD.  fvAccP is only created when a BD is explicitly placed in
+    legacy/L2 mode; its absence means the BD is L3, regardless of unicastRoute
+    or flood-mode attributes.
 
-    def is_l2(attrs: dict, has_subnet: bool):
-        """
-        A BD is L2 (weight=1 in PxV) when:
-          - unicastRoute is explicitly disabled, AND
-          - no subnets are configured.
-
-        The flood-mode attributes (unkMacUcastAct, arpFlood, multiDstPktAct)
-        describe *how* a BD floods but do not affect the L2/L3 PxV weight.
-        Any BD with routing disabled and no subnets is hardware-L2 regardless
-        of those settings.
-
-        Everything else is L3 (weight=2): routing enabled, subnets present,
-        or unicastRoute unset/unknown (conservative default).
-        """
-        if has_subnet:
-            return False, "L3: fvSubnet present"
-        u = norm(attrs.get("unicastRoute"))
-        if u not in FALSE:
-            return False, f"L3: unicastRoute='{u or 'unset'}' is not disabled"
-        return True, "L2: unicastRoute disabled, no subnets"
-
+    Cisco guidance: moquery -c fvAccP | grep -E '^dn'
+    Any BD whose DN appears in that output is in legacy mode (L2, weight=1).
+    """
     out = {}
     if debug:
-        print("\n================= DEBUG: BD L2/L3 DETECTION (refined) =================")
+        print("\n================= DEBUG: BD L2/L3 DETECTION =================")
     for mo in api_data.get("fvBD", []):  # FIX #12
         bd = mo.get("fvBD")
         if not bd: continue
         attrs = bd["attributes"]
         # FIX #13: store raw DN for output; use norm_dn only for map key
-        raw_dn = attrs["dn"]
+        raw_dn = attrs.get("dn", "")
         dn = norm_dn(raw_dn)
-        subnets = []
-        for k, n in iter_children(bd):
-            if k == "fvSubnet":
-                subnets.append(n["attributes"].get("ip"))
-        has_subnet = bool(subnets)
 
-        l2, reason = is_l2(attrs, has_subnet)
-        out[dn] = False if l2 else True   # False = L2, True = L3
+        has_accp = any(k == "fvAccP" for k, _ in iter_children(bd))
+        # False = L2 (legacy), True = L3
+        out[dn] = not has_accp
 
         if debug:
-            print(f"\nBD: {raw_dn}")  # FIX #13: print raw DN
+            print(f"\nBD: {raw_dn}")
+            print(f"  fvAccP present   : {has_accp}")
             print(f"  unicastRoute     : {attrs.get('unicastRoute')}")
-            print(f"  fvSubnet (count) : {len(subnets)}")
-            if l2:
-                print(f"  -> Classified as L2 — {reason}")
+            if has_accp:
+                print(f"  -> Classified as L2 (fvAccP present)")
             else:
-                print(f"  -> Classified as L3 — {reason}")
+                print(f"  -> Classified as L3 (no fvAccP)")
 
     if debug:
-        print("=======================================================================\n")
+        print("==============================================================\n")
     return out
 
 def po_members(api_data):
@@ -1169,7 +1149,7 @@ def main():
     pg_bndl = fetch_full("infraAccBndlGrp",  "rsp-subtree=full")
     data["policy_groups_full"] = pg_acc + pg_bndl
 
-    data["fvBD"] = fetch_full("fvBD", "rsp-subtree=full&rsp-subtree-class=fvSubnet")
+    data["fvBD"] = fetch_full("fvBD", "rsp-subtree=full&rsp-subtree-class=fvSubnet,fvAccP")
 
     fvA_full = fetch_full("fvAEPg", "rsp-subtree=full&rsp-subtree-class=fvRsBd,fvRsPathAtt,fvRsDomAtt")
     fvE_full = fetch_full("fvEPg",  "rsp-subtree=full&rsp-subtree-class=fvRsBd,fvRsPathAtt,fvRsDomAtt")
