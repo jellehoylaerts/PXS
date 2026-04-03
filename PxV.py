@@ -1097,6 +1097,8 @@ def parse_args():
                    help="Name of the certificate registered in APIC under the user account "
                         "(e.g. 'admin' → DN: uni/userext/user-{user}/usercert-{cert-name}). "
                         "Defaults to the username when --key is used.")
+    p.add_argument("--prompt-password", action="store_true",
+                   help="Prompt interactively for a password instead of using certificate auth.")
     p.add_argument("--verify", action="store_true")
     p.add_argument("--workers", type=int, default=40, help="Subtree concurrency (default 40)")
     p.add_argument("--subtree-chunk", type=int, default=500,
@@ -1138,7 +1140,7 @@ def main():
     user = a.user  # already defaults to "aciansible"
 
     key_file = a.key
-    if not a.password and not key_file:
+    if not a.password and not a.prompt_password and not key_file:
         # Pick key based on whether the target looks like a lab or prod environment
         target = (a.env or host).lower()
         if "lab" in target:
@@ -1147,7 +1149,7 @@ def main():
             key_file = "/app/git/rhosp_ansible/pki/aci-ans-prodkey"
         else:
             print("Cannot auto-select key: environment name contains neither 'lab' nor 'prod'. "
-                  "Provide --key or --password explicitly."); sys.exit(1)
+                  "Provide --key, --password, or --prompt-password explicitly."); sys.exit(1)
         print(f"Auto-selected key: {key_file}")
 
     # Build auth: certificate takes priority over password
@@ -1162,8 +1164,8 @@ def main():
             print(f"Failed to load certificate key: {e}"); sys.exit(1)
         pwd = None
     else:
-        pwd = a.password or getpass.getpass("APIC Password: ")
-        if not pwd: print("No password"); sys.exit(1)
+        pwd = a.password or getpass.getpass(f"APIC Password for {user}: ")
+        if not pwd: print("No password provided"); sys.exit(1)
 
     class_workers   = min(8, max(4, a.workers // 4))
     subtree_workers = a.workers
