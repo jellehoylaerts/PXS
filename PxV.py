@@ -46,9 +46,58 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from requests.adapters import HTTPAdapter
+from requests.auth import AuthBase
 from urllib3.util.retry import Retry
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ---------- certificate auth ----------
+try:
+    import base64
+    from urllib.parse import urlparse
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+    _CRYPTO_AVAILABLE = True
+except ImportError:
+    _CRYPTO_AVAILABLE = False
+
+class APICCertAuth(AuthBase):
+    """
+    Requests auth plugin for APIC X.509 signature-based authentication.
+
+    Each request is signed with the private key.  No login session is needed.
+    Signature payload: HTTP_METHOD + URL_PATH_WITH_QUERY + REQUEST_BODY
+    The certificate must be registered in APIC under:
+      uni/userext/user-{username}/usercert-{cert_name}
+    """
+    def __init__(self, cert_dn: str, key_file: str):
+        if not _CRYPTO_AVAILABLE:
+            raise RuntimeError(
+                "Certificate authentication requires the 'cryptography' package. "
+                "Install it with: pip install cryptography"
+            )
+        self.cert_dn = cert_dn
+        with open(key_file, "rb") as f:
+            self.private_key = serialization.load_pem_private_key(f.read(), password=None)
+
+    def _sign(self, method: str, path: str, body: str) -> str:
+        payload = (method.upper() + path + body).encode("utf-8")
+        sig = self.private_key.sign(payload, asym_padding.PKCS1v15(), hashes.SHA256())
+        return base64.b64encode(sig).decode("utf-8")
+
+    def __call__(self, r):
+        parsed = urlparse(r.url)
+        path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        body = r.body or ""
+        if isinstance(body, bytes):
+            body = body.decode("utf-8")
+        sig = self._sign(r.method, path, body)
+        r.headers["Cookie"] = ""   # no session cookie for cert auth
+        r.headers["APIC-request-signature"]    = sig
+        r.headers["APIC-certificate-algorithm"] = "v1.0"
+        r.headers["APIC-certificate-dn"]        = self.cert_dn
+        r.headers["APIC-certificate-fingerprint"] = "fingerprint"
+        return r
 
 # ---------- env ----------
 APIC_ENV = {
@@ -150,9 +199,9 @@ class APIC:
       - parallel subtree DN fetching (chunked to avoid connection exhaustion — Fix #6)
       - configurable AAA login domain (Fix #11)
     """
-    def __init__(self, host, user, pwd, domain="Telco_Cloud", verify=False, http_log=False,
+    def __init__(self, host, user, pwd=None, domain="Telco_Cloud", verify=False, http_log=False,
                  class_workers=8, subtree_workers=32, page_size=1000, timeout=60,
-                 subtree_chunk=500):
+                 subtree_chunk=500, cert_auth: APICCertAuth = None):
         if not host.startswith("http"): host = "https://" + host
         self.url = host.rstrip("/")
         self.user = user
@@ -165,6 +214,7 @@ class APIC:
         self.page_size = max(200, int(page_size))
         self.timeout = max(10, int(timeout))
         self.subtree_chunk = max(50, int(subtree_chunk))  # FIX #6
+        self.cert_auth = cert_auth    # APICCertAuth instance, or None for password auth
 
         s = requests.Session()
         r = Retry(
@@ -175,6 +225,8 @@ class APIC:
         a = HTTPAdapter(max_retries=r, pool_maxsize=max(64, 2*(self.class_workers + self.subtree_workers)))
         s.mount("https://", a); s.mount("http://", a)
         s.headers.update({"Accept": "application/json"})
+        if cert_auth:
+            s.auth = cert_auth        # applied automatically to every request
         self.sess = s
 
         # FIX (original): only wrap request logger when http_log is enabled
@@ -188,6 +240,8 @@ class APIC:
             self.sess.request = logged_request
 
     def login(self):
+        if self.cert_auth:
+            return   # certificate auth is stateless — no login needed
         # FIX #11: use self.domain instead of hardcoded "Telco_Cloud"
         payload = {"aaaUser": {"attributes": {"name": f"apic:{self.domain}\\{self.user}", "pwd": self.pwd}}}
         r = self.sess.post(f"{self.url}/api/aaaLogin.json", json=payload, verify=self.verify, timeout=20)
@@ -196,6 +250,8 @@ class APIC:
             raise RuntimeError("APIC-cookie missing after login")
 
     def _cookie_expired(self, response):
+        if self.cert_auth:
+            return False   # cert auth never expires; 401/403 = real error
         if response.status_code in (401, 403):
             try:
                 data = response.json()
@@ -1034,6 +1090,13 @@ def parse_args():
     # FIX #11: configurable AAA login domain (was hardcoded as "Telco_Cloud")
     p.add_argument("--domain", default=os.getenv("APIC_DOMAIN", "Telco_Cloud"),
                    help="AAA login domain (default: Telco_Cloud or $APIC_DOMAIN env var)")
+    p.add_argument("--key", default=os.getenv("APIC_KEY"),
+                   help="Path to PEM private key file for X.509 certificate authentication "
+                        "(alternative to --password). Requires 'cryptography' package.")
+    p.add_argument("--cert-name", default=os.getenv("APIC_CERT_NAME"),
+                   help="Name of the certificate registered in APIC under the user account "
+                        "(e.g. 'admin' → DN: uni/userext/user-{user}/usercert-{cert-name}). "
+                        "Required when --key is used.")
     p.add_argument("--verify", action="store_true")
     p.add_argument("--workers", type=int, default=40, help="Subtree concurrency (default 40)")
     p.add_argument("--subtree-chunk", type=int, default=500,
@@ -1072,8 +1135,22 @@ def main():
         print("Specify --apic or --env"); sys.exit(1)
 
     if not a.user: print("Missing --user"); sys.exit(1)
-    pwd = a.password or getpass.getpass("APIC Password: ")
-    if not pwd: print("No password"); sys.exit(1)
+
+    # Build auth: certificate takes priority over password
+    cert_auth = None
+    if a.key:
+        if not a.cert_name:
+            print("--cert-name is required when using --key"); sys.exit(1)
+        cert_dn = f"uni/userext/user-{a.user}/usercert-{a.cert_name}"
+        try:
+            cert_auth = APICCertAuth(cert_dn, a.key)
+            print(f"Using certificate authentication (cert DN: {cert_dn})")
+        except Exception as e:
+            print(f"Failed to load certificate key: {e}"); sys.exit(1)
+        pwd = None
+    else:
+        pwd = a.password or getpass.getpass("APIC Password: ")
+        if not pwd: print("No password"); sys.exit(1)
 
     class_workers   = min(8, max(4, a.workers // 4))
     subtree_workers = a.workers
@@ -1087,6 +1164,7 @@ def main():
         page_size=a.page_size,
         timeout=60,
         subtree_chunk=a.subtree_chunk,  # FIX #6
+        cert_auth=cert_auth,
     )
     api.login()
 
