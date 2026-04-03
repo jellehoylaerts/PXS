@@ -54,9 +54,12 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ---------- certificate auth ----------
 try:
     import base64
+    import datetime
     from urllib.parse import urlparse
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
     _CRYPTO_AVAILABLE = True
 except ImportError:
     _CRYPTO_AVAILABLE = False
@@ -103,6 +106,77 @@ class APICCertAuth(AuthBase):
         r.headers["APIC-certificate-dn"]        = self.cert_dn
         r.headers["APIC-certificate-fingerprint"] = "fingerprint"
         return r
+
+def setup_cert(host, user, pwd, domain, cert_name, key_file, verify=False):
+    """
+    One-time bootstrap: generate a self-signed X.509 certificate from the private key
+    and register it in APIC under the user account.  After this, certificate auth works.
+
+    APIC MO path: uni/userext/user-{user}/usercert-{cert_name}
+    """
+    if not _CRYPTO_AVAILABLE:
+        print("ERROR: 'cryptography' package required. pip install cryptography")
+        sys.exit(1)
+
+    # Load private key
+    try:
+        with open(key_file, "rb") as f:
+            private_key = serialization.load_pem_private_key(f.read(), password=None)
+    except Exception as e:
+        print(f"ERROR: Cannot load private key from {key_file!r}: {e}")
+        sys.exit(1)
+
+    # Build a minimal self-signed certificate (10-year validity)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, user)])
+    now = datetime.datetime.utcnow()
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(private_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .sign(private_key, hashes.SHA256())
+    )
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
+    print(f"Generated self-signed certificate (CN={user}, cert name={cert_name!r})")
+
+    if not host.startswith("http"):
+        host = "https://" + host
+    host = host.rstrip("/")
+
+    sess = requests.Session()
+    # One-time password login
+    login_payload = {"aaaUser": {"attributes": {
+        "name": f"apic:{domain}\\{user}",
+        "pwd": pwd,
+    }}}
+    r = sess.post(f"{host}/api/aaaLogin.json", json=login_payload, verify=verify, timeout=20)
+    if r.status_code != 200:
+        try:
+            err = r.json().get("imdata", [{}])[0].get("error", {}).get("attributes", {})
+            print(f"Login failed: code={err.get('code')} text={err.get('text')!r}")
+        except Exception:
+            print(f"Login failed ({r.status_code}): {r.text[:300]!r}")
+        sys.exit(1)
+    print(f"Logged in as {user}@{domain}")
+
+    # POST the certificate to APIC
+    mo_url = f"{host}/api/node/mo/uni/userext/user-{user}/usercert-{cert_name}.json"
+    cert_payload = {"aaaUserCert": {"attributes": {"name": cert_name, "data": cert_pem}}}
+    r = sess.post(mo_url, json=cert_payload, verify=verify, timeout=20)
+    if r.status_code not in (200, 201):
+        try:
+            err = r.json().get("imdata", [{}])[0].get("error", {}).get("attributes", {})
+            print(f"Certificate registration failed: code={err.get('code')} text={err.get('text')!r}")
+        except Exception:
+            print(f"Certificate registration failed ({r.status_code}): {r.text[:300]!r}")
+        sys.exit(1)
+
+    print(f"Certificate '{cert_name}' registered under uni/userext/user-{user}/usercert-{cert_name}")
+    print("Certificate authentication is now active — no password needed on future runs.")
+
 
 # ---------- env ----------
 APIC_ENV = {
@@ -1129,6 +1203,9 @@ def parse_args():
     p.add_argument("--page-size", type=int, default=1000,
                    help="APIC API page-size for pagination (default 1000)")
     p.add_argument("--http-log", action="store_true", help="Print HTTP requests (debug)")
+    p.add_argument("--setup-cert", action="store_true",
+                   help="One-time bootstrap: generate a self-signed certificate from --key "
+                        "and register it in APIC. Requires --password or --prompt-password.")
     p.add_argument(
         "--ports-mode",
         choices=["base", "lanes", "active"],
@@ -1165,6 +1242,18 @@ def main():
             print("Cannot auto-select key: environment name contains neither 'lab' nor 'prod'. "
                   "Provide --key, --password, or --prompt-password explicitly."); sys.exit(1)
         print(f"Auto-selected key: {key_file}")
+
+    # --setup-cert: register certificate in APIC using one-time password auth
+    if a.setup_cert:
+        if not key_file:
+            print("--setup-cert requires --key (path to private key file).")
+            sys.exit(1)
+        setup_pwd = a.password or getpass.getpass(f"APIC Password for {user} (one-time bootstrap): ")
+        if not setup_pwd:
+            print("No password provided."); sys.exit(1)
+        cert_name = a.cert_name or user
+        setup_cert(host, user, setup_pwd, a.domain, cert_name, key_file, verify=a.verify)
+        sys.exit(0)
 
     # Build auth: certificate takes priority over password
     cert_auth = None
