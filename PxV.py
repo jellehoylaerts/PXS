@@ -54,7 +54,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ---------- certificate auth ----------
 try:
     import base64
-    from urllib.parse import urlparse
+    from urllib.parse import urlparse, unquote
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
     _CRYPTO_AVAILABLE = True
@@ -70,13 +70,14 @@ class APICCertAuth(AuthBase):
     The certificate must be registered in APIC under:
       uni/userext/user-{username}/usercert-{cert_name}
     """
-    def __init__(self, cert_dn: str, key_file: str):
+    def __init__(self, cert_dn: str, key_file: str, debug: bool = False):
         if not _CRYPTO_AVAILABLE:
             raise RuntimeError(
                 "Certificate authentication requires the 'cryptography' package. "
                 "Install it with: pip install cryptography"
             )
         self.cert_dn = cert_dn
+        self._debug = debug
         with open(key_file, "rb") as f:
             self.private_key = serialization.load_pem_private_key(f.read(), password=None)
 
@@ -86,14 +87,17 @@ class APICCertAuth(AuthBase):
         return base64.b64encode(sig).decode("utf-8")
 
     def __call__(self, r):
-        # path_url is the raw path + query string as sent in the HTTP request
-        # line (e.g. /api/class/fvBD.json?page-size=1000&...).  Using r.url
-        # directly would include scheme+host which APIC does not sign against.
         parsed = urlparse(r.url)
-        path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        # URL-decode the path so the signature payload matches what APIC
+        # computes on its side (APIC normalises %-encoded chars like %7C → |
+        # before verifying).  requests encodes | as %7C in the order-by param;
+        # signing the encoded form produces a mismatch and a 403.
+        path = unquote(parsed.path + (f"?{parsed.query}" if parsed.query else ""))
         body = r.body or ""
         if isinstance(body, bytes):
             body = body.decode("utf-8")
+        if self._debug:
+            print(f"[CERT-AUTH] signing: {r.method}{path!r}  body_len={len(body)}")
         sig = self._sign(r.method, path, body)
         # APIC requires Cookie: APIC-cookie=<cert_dn> (not empty) to identify
         # which certificate to verify the signature against.
@@ -1163,7 +1167,7 @@ def main():
         cert_name = a.cert_name or user   # default cert name = username
         cert_dn = f"uni/userext/user-{user}/usercert-{cert_name}"
         try:
-            cert_auth = APICCertAuth(cert_dn, key_file)
+            cert_auth = APICCertAuth(cert_dn, key_file, debug=a.http_log)
             print(f"Using certificate authentication (cert DN: {cert_dn})")
         except Exception as e:
             print(f"Failed to load certificate key: {e}"); sys.exit(1)
