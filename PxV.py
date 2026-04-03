@@ -7,13 +7,12 @@ ACI PxV - Single-file full rewrite (optimized)
 - Collects fvRsPathAtt once (class-level) and filters locally for speed.
 - Uses separate thread pools for class scans and subtree fetches.
 - Preserves original CLI interface and output format.
-- UPDATED: Legacy BD (L2_BD) detection aligned with Cisco guidance:
-    * Legacy BD (L2_BD) only when ALL are true and no subnets exist:
-        - unicastRoute = disabled/false/off/0
-        - unkMacUcastAct = flood
-        - arpFlood = enabled/true/on/1
-        - multiDstPktAct contains "flood" (e.g., bd-flood)
-      Otherwise, BD is treated as normal (L3_BD).
+- BD L2/L3 classification for PxV weight:
+    * L2 BD (weight=1): unicastRoute=disabled AND no subnets configured.
+    * L3 BD (weight=2): everything else (routing enabled, subnets present,
+      or unicastRoute unset/unknown).
+    * Flood-mode attributes (unkMacUcastAct, arpFlood, multiDstPktAct) do
+      NOT affect the PxV weight — they describe flood behaviour only.
 
 FIXES (April 2026):
 - Fix #1:  collect_static_from_epgs: only process direct fvRsPathAtt children,
@@ -614,32 +613,31 @@ def vlan_to_bd(api_data):
     return m
 
 def bd_l3_map(api_data, debug=False):
-    TRUE  = {"yes", "true", "enabled", "on", "1"}
     FALSE = {"no", "false", "disabled", "off", "0"}
 
     def norm(v: str) -> str:
         return (v or "").strip().lower()
 
-    def is_flood(v: str) -> bool:
-        x = norm(v)
-        return (x in {"bd-flood", "flood", "encap-flood"}) or ("flood" in x)
+    def is_l2(attrs: dict, has_subnet: bool):
+        """
+        A BD is L2 (weight=1 in PxV) when:
+          - unicastRoute is explicitly disabled, AND
+          - no subnets are configured.
 
-    def is_legacy(attrs: dict, has_subnet: bool):
+        The flood-mode attributes (unkMacUcastAct, arpFlood, multiDstPktAct)
+        describe *how* a BD floods but do not affect the L2/L3 PxV weight.
+        Any BD with routing disabled and no subnets is hardware-L2 regardless
+        of those settings.
+
+        Everything else is L3 (weight=2): routing enabled, subnets present,
+        or unicastRoute unset/unknown (conservative default).
+        """
         if has_subnet:
-            return False, "not legacy: fvSubnet present"
+            return False, "L3: fvSubnet present"
         u = norm(attrs.get("unicastRoute"))
         if u not in FALSE:
-            return False, f"not legacy: unicastRoute='{u or 'unset'}' is not disabled"
-        unk = norm(attrs.get("unkMacUcastAct"))
-        if unk != "flood":
-            return False, f"not legacy: unkMacUcastAct='{unk or 'unset'}' is not flood"
-        arp = norm(attrs.get("arpFlood"))
-        if arp not in TRUE:
-            return False, f"not legacy: arpFlood='{arp or 'unset'}' is not enabled"
-        mcast = norm(attrs.get("multiDstPktAct"))
-        if not is_flood(mcast):
-            return False, f"not legacy: multiDstPktAct='{mcast or 'unset'}' is not flood"
-        return True, "legacy BD (L2_BD)"
+            return False, f"L3: unicastRoute='{u or 'unset'}' is not disabled"
+        return True, "L2: unicastRoute disabled, no subnets"
 
     out = {}
     if debug:
@@ -657,18 +655,15 @@ def bd_l3_map(api_data, debug=False):
                 subnets.append(n["attributes"].get("ip"))
         has_subnet = bool(subnets)
 
-        legacy, reason = is_legacy(attrs, has_subnet)
-        out[dn] = False if legacy else True
+        l2, reason = is_l2(attrs, has_subnet)
+        out[dn] = False if l2 else True   # False = L2, True = L3
 
         if debug:
             print(f"\nBD: {raw_dn}")  # FIX #13: print raw DN
             print(f"  unicastRoute     : {attrs.get('unicastRoute')}")
-            print(f"  unkMacUcastAct   : {attrs.get('unkMacUcastAct')}")
-            print(f"  arpFlood         : {attrs.get('arpFlood')}")
-            print(f"  multiDstPktAct   : {attrs.get('multiDstPktAct')}")
             print(f"  fvSubnet (count) : {len(subnets)}")
-            if legacy:
-                print(f"  -> Classified as L2 (LEGACY) — {reason}")
+            if l2:
+                print(f"  -> Classified as L2 — {reason}")
             else:
                 print(f"  -> Classified as L3 — {reason}")
 
