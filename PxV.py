@@ -153,7 +153,7 @@ class APIC:
       - configurable AAA login domain (Fix #11)
     """
     def __init__(self, host, user, pwd, domain="Telco_Cloud", verify=False, http_log=False,
-                 class_workers=8, subtree_workers=32, page_size=5000, timeout=60,
+                 class_workers=8, subtree_workers=32, page_size=1000, timeout=60,
                  subtree_chunk=500):
         if not host.startswith("http"): host = "https://" + host
         self.url = host.rstrip("/")
@@ -277,13 +277,15 @@ class APIC:
                 r = self._request_with_reauth("GET", u, verify=self.verify, timeout=self.timeout)
                 r.raise_for_status()
                 return r.json().get("imdata") or []  # FIX #12
-            except Exception:
+            except Exception as exc:
+                print(f"  [WARN] fetch_subtrees: failed to fetch '{dn}': {exc}")
                 return []
 
-        # Process in chunks to avoid flooding APIC with thousands of simultaneous connections
-        for i in range(0, len(dns), self.subtree_chunk):
-            chunk = dns[i : i + self.subtree_chunk]
-            with ThreadPoolExecutor(max_workers=self.subtree_workers) as ex:
+        # Single executor across all chunks to avoid per-chunk startup/teardown overhead.
+        # Chunks are still submitted sequentially to avoid flooding APIC (Fix #6).
+        with ThreadPoolExecutor(max_workers=self.subtree_workers) as ex:
+            for i in range(0, len(dns), self.subtree_chunk):
+                chunk = dns[i : i + self.subtree_chunk]
                 fs = [ex.submit(one, d) for d in chunk]
                 for f in as_completed(fs):
                     out.extend(f.result())
@@ -404,7 +406,10 @@ def nodep_to_nodes(node_tree):
     out = {}
     for mo in node_tree:  # FIX #12
         if "infraNodeP" not in mo: continue
-        np = mo["infraNodeP"]; dn = norm_dn(np["attributes"]["dn"]); nodes = set()
+        np = mo["infraNodeP"]
+        dn = norm_dn((np.get("attributes") or {}).get("dn", ""))
+        if not dn: continue
+        nodes = set()
         for k, n in iter_children_deep(np):
             if k == "infraLeafS":
                 for ck, blk in iter_children(n):
@@ -454,7 +459,7 @@ def pg_to_ifaces(acc_tree, acc_to_nodes, debug=False):
             if k != "infraHPortS": continue
             tgt = None; ifs = set()
             for ck, ch in iter_children(hps):
-                if ck in ("infraRsAccBaseGrp", "infraRsAccBndlSubgrp", "infraRsAttEntP"):
+                if ck in ("infraRsAccBaseGrp", "infraRsAccBndlSubgrp"):
                     tgt = norm_dn(ch["attributes"]["tDn"]); break
             if not tgt: continue
             for ck, ch in iter_children(hps):
@@ -606,18 +611,6 @@ def vlan_to_bd(api_data):
                             if bd_dn:
                                 m[enc].add(bd_dn)
 
-    for mo in api_data.get("fvAEPg", []) + api_data.get("fvEPg", []):  # FIX #12
-        epg = mo.get("fvAEPg") or mo.get("fvEPg")
-        if not epg: continue
-        epg_dn = norm_dn(epg["attributes"]["dn"])
-        bd_dn = epg_to_bd.get(epg_dn)
-        if not bd_dn: continue
-        for k, n in iter_children(epg):
-            if k == "fvRsDomAtt":
-                enc = (n["attributes"].get("encap") or "").strip()
-                if enc.startswith("vlan-"):
-                    m[enc].add(bd_dn)
-
     return m
 
 def bd_l3_map(api_data, debug=False):
@@ -686,7 +679,10 @@ def bd_l3_map(api_data, debug=False):
 def po_members(api_data):
     out = defaultdict(lambda: defaultdict(set))
     for mo in api_data.get("pcRsMbrIfs", []):  # FIX #12
-        a = mo["pcRsMbrIfs"]["attributes"]
+        inner = mo.get("pcRsMbrIfs")
+        if not inner: continue
+        a = inner.get("attributes", {})
+        if not a: continue
         dn = a.get("dn", "") or a.get("rn", ""); t = a.get("tDn", "")
         mn = RE_NODE_DN.search(dn) or RE_NODE_DN.search(t)
         if not mn: continue
@@ -704,7 +700,10 @@ def po_members(api_data):
 def logical_to_po(api_data):
     out = defaultdict(dict)
     for mo in api_data.get("pcAggrIf", []):  # FIX #12
-        a = mo["pcAggrIf"]["attributes"]; dn = a.get("dn", ""); mn = RE_NODE_DN.search(dn)
+        inner = mo.get("pcAggrIf")
+        if not inner: continue
+        a = inner.get("attributes", {})
+        dn = a.get("dn", ""); mn = RE_NODE_DN.search(dn)
         if not mn: continue
         node = mn.group(1); name = norm_agg(a.get("name", "")); pc = a.get("pcId", "")
         if name and pc: out[node][name] = f"po{pc}"
@@ -714,32 +713,27 @@ def compute_pxv_per_port(static_pxv, aaep_pxv, vlan_to_bd, bd_l3_map, debug=Fals
     """
     FIX #4: Warn when "?" (unmapped) node entries are dropped.
     FIX #5: Warn when a BD DN is not found in bd_l3_map (defaults to L3/weight=2).
+    PERF:   Pre-group aaep_pxv by node to avoid O(N×M) per-node scans.
     """
     results = {}
 
-    # FIX #4: collect and warn about unmapped "?" entries
-    unmapped_ifaces = defaultdict(set)
-    for (n, iface) in aaep_pxv.keys():
-        if n == "?":
-            unmapped_ifaces["?"].add(iface)
+    # Pre-group aaep_pxv by node for O(1) per-node lookup
+    aaep_by_node = defaultdict(dict)
+    for (n, iface), vlans in aaep_pxv.items():
+        aaep_by_node[n][iface] = vlans
 
-    if unmapped_ifaces:
-        total_unmapped = len(unmapped_ifaces.get("?", set()))
-        print(f"  [WARN] {total_unmapped} interface(s) have no node mapping (node='?') "
+    # FIX #4: collect and warn about unmapped "?" entries
+    unmapped = aaep_by_node.pop("?", {})
+    if unmapped:
+        print(f"  [WARN] {len(unmapped)} interface(s) have no node mapping (node='?') "
               f"and will be excluded from PxV calculation. "
               f"Check infraHPortS→infraRsAccBaseGrp/infraRsAccBndlSubgrp bindings.")
         if debug:
-            for iface in sorted(unmapped_ifaces["?"]):
-                vlans = aaep_pxv.get(("?", iface), set())
+            for iface, vlans in sorted(unmapped.items()):
                 print(f"    unmapped iface: {iface}  vlans={len(vlans)}")
 
-    nodes = set()
-    for n in static_pxv.keys():
-        if str(n).isdigit():
-            nodes.add(str(n))
-    for (n, _iface) in aaep_pxv.keys():
-        if str(n).isdigit():
-            nodes.add(str(n))
+    nodes = set(str(n) for n in static_pxv.keys() if str(n).isdigit())
+    nodes |= set(n for n in aaep_by_node.keys() if str(n).isdigit())
 
     missing_bds_warned = set()  # FIX #5
 
@@ -747,17 +741,12 @@ def compute_pxv_per_port(static_pxv, aaep_pxv, vlan_to_bd, bd_l3_map, debug=Fals
         node_data = {}
         node_total = 0
 
-        ifaces = set()
-        if node in static_pxv:
-            ifaces |= set(static_pxv[node].keys())
-        for (n, iface) in aaep_pxv.keys():
-            if n == node:
-                ifaces.add(iface)
+        ifaces = set(static_pxv.get(node, {}).keys()) | set(aaep_by_node.get(node, {}).keys())
 
         for iface in sorted(ifaces):
             vlans = set()
             vlans |= static_pxv.get(node, {}).get(iface, set())
-            vlans |= aaep_pxv.get((node, iface), set())
+            vlans |= aaep_by_node.get(node, {}).get(iface, set())
 
             bds = set()
             for vlan in vlans:
@@ -866,8 +855,14 @@ def compute(api, api_data, acc_tree, node_tree, static_pxv, totals_only, ports_o
             "pxv_value": rec["node_pxv"],
         }
 
+    # Pre-group aaep_pxv by node for O(1) per-leaf lookup (avoids O(N×M) scan)
+    aaep_by_node = defaultdict(dict)
+    for (n, iface), vlans in aaep_pxv.items():
+        aaep_by_node[n][iface] = vlans
+
     for leaf_node, leaf_name in sorted(leafs.items(), key=lambda x: int(x[0])):
-        all_if = set(static_pxv.get(leaf_node, {}).keys()) | {f for (n, f) in aaep_pxv if n == leaf_node}
+        node_aaep = aaep_by_node.get(leaf_node, {})
+        all_if = set(static_pxv.get(leaf_node, {}).keys()) | set(node_aaep.keys())
         active = set()
         node_po  = po_by_node.get(leaf_node, {})
         node_l2h = l2h_by_node.get(leaf_node, {})
@@ -878,7 +873,7 @@ def compute(api, api_data, acc_tree, node_tree, static_pxv, totals_only, ports_o
         logical_only = {}
 
         for iface in all_if:
-            vset = static_pxv.get(leaf_node, {}).get(iface, set()) | aaep_pxv.get((leaf_node, iface), set())
+            vset = static_pxv.get(leaf_node, {}).get(iface, set()) | node_aaep.get(iface, set())
             if not vset: continue
             nf = norm_if(iface)
             if nf.startswith("eth"):
@@ -955,15 +950,21 @@ def compute(api, api_data, acc_tree, node_tree, static_pxv, totals_only, ports_o
 
 # ---------- output ----------
 def build_json(leafs, static_pxv, aaep_pxv, hw_stats, totals_only, pxv_limit):
+    # Pre-group for O(1) per-node lookup
+    aaep_by_node = defaultdict(dict)
+    for (n, iface), vlans in aaep_pxv.items():
+        aaep_by_node[n][iface] = vlans
+
     out = {"nodes": {}}
     for node, host in leafs.items():
         ne = {"hostname": host}
-        ifaces = set(static_pxv.get(node, {}).keys()) | {f for (n, f) in aaep_pxv if n == node}
+        node_aaep = aaep_by_node.get(node, {})
+        ifaces = set(static_pxv.get(node, {}).keys()) | set(node_aaep.keys())
         st = at = ut = 0
         if not totals_only: ne["interfaces"] = {}
         for iface in sorted(ifaces, key=if_sort_key):
             s = static_pxv.get(node, {}).get(iface, set())
-            a = aaep_pxv.get((node, iface), set())
+            a = node_aaep.get(iface, set())
             u = s | a
             st += len(s); at += len(a); ut += len(u)
             if not totals_only:
@@ -987,15 +988,21 @@ def build_json(leafs, static_pxv, aaep_pxv, hw_stats, totals_only, pxv_limit):
     return out
 
 def print_text(leafs, static_pxv, aaep_pxv, hw_stats, totals_only, pxv_limit):
+    # Pre-group for O(1) per-node lookup
+    aaep_by_node = defaultdict(dict)
+    for (n, iface), vlans in aaep_pxv.items():
+        aaep_by_node[n][iface] = vlans
+
     print("\n==============================================")
     print("          ACI PxV REPORT (Selector-Based)")
     print("==============================================\n")
     for node, host in sorted(leafs.items(), key=lambda x: int(x[0])):
         print(f"\nLeaf {host} (Node {node})\n")
-        ifs = sorted(set(static_pxv.get(node, {}).keys()) | {f for (n, f) in aaep_pxv if n == node}, key=if_sort_key)
+        node_aaep = aaep_by_node.get(node, {})
+        ifs = sorted(set(static_pxv.get(node, {}).keys()) | set(node_aaep.keys()), key=if_sort_key)
         st = at = ut = 0
         for f in ifs:
-            s = static_pxv.get(node, {}).get(f, set()); a = aaep_pxv.get((node, f), set()); u = s | a
+            s = static_pxv.get(node, {}).get(f, set()); a = node_aaep.get(f, set()); u = s | a
             st += len(s); at += len(a); ut += len(u)
             if not totals_only:
                 print(f"  {f:30s} static={len(s):4d} aaep={len(a):4d} union={len(u):4d}")
@@ -1131,7 +1138,14 @@ def main():
     static_pxv = collect_static_from_epgs(data["fvAEPg"] + data["fvEPg"])
 
     if not static_pxv:
-        epg_dns = api.fetch_dns("fvAEPg") + api.fetch_dns("fvEPg")
+        # Derive DNs from already-fetched objects; avoid redundant API calls
+        epg_dns = []
+        for mo in data["fvAEPg"] + data["fvEPg"]:
+            if not mo: continue
+            inner = next(iter(mo.values()), None)
+            if inner:
+                dn = (inner.get("attributes") or {}).get("dn")
+                if dn: epg_dns.append(dn)
         epg_rs_only = api.fetch_subtrees(
             epg_dns,
             "rsp-subtree=children&rsp-subtree-class=fvRsPathAtt"
