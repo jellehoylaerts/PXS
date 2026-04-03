@@ -709,13 +709,21 @@ def logical_to_po(api_data):
         if name and pc: out[node][name] = f"po{pc}"
     return out
 
-def compute_pxv_per_port(static_pxv, aaep_pxv, vlan_to_bd, bd_l3_map, debug=False):
+def compute_pxv_per_port(static_pxv, aaep_pxv, vlan_to_bd, bd_l3_map,
+                         po_by_node=None, l2h_by_node=None, debug=False):
     """
     FIX #4: Warn when "?" (unmapped) node entries are dropped.
     FIX #5: Warn when a BD DN is not found in bd_l3_map (defaults to L3/weight=2).
     PERF:   Pre-group aaep_pxv by node to avoid O(N×M) per-node scans.
+    FIX: Logical interfaces (VPC/PC) are resolved to their physical eth member ports
+         before PxV is summed so that VLANs are not double-counted (once on the
+         logical interface and once on its eth members).  Only eth* ports are
+         emitted in the result; the 'ports_used' count therefore reflects real
+         physical ports, not logical bundles.
     """
     results = {}
+    po_by_node  = po_by_node  or {}
+    l2h_by_node = l2h_by_node or {}
 
     # Pre-group aaep_pxv by node for O(1) per-node lookup
     aaep_by_node = defaultdict(dict)
@@ -738,15 +746,54 @@ def compute_pxv_per_port(static_pxv, aaep_pxv, vlan_to_bd, bd_l3_map, debug=Fals
     missing_bds_warned = set()  # FIX #5
 
     for node in sorted(nodes, key=lambda x: int(x)):
-        node_data = {}
-        node_total = 0
+        node_po  = po_by_node.get(node, {})
+        node_l2h = l2h_by_node.get(node, {})
 
-        ifaces = set(static_pxv.get(node, {}).keys()) | set(aaep_by_node.get(node, {}).keys())
+        # Accumulate VLANs per *physical* eth port only.
+        # Logical interfaces (VPC/PC/bundle names) are resolved to their member
+        # eth ports so that VLANs are attributed to hardware ports exactly once.
+        phys_vlans: dict[str, set] = defaultdict(set)
 
-        for iface in sorted(ifaces):
+        all_ifaces = set(static_pxv.get(node, {}).keys()) | set(aaep_by_node.get(node, {}).keys())
+        unresolved_logical = []
+
+        for iface in all_ifaces:
             vlans = set()
             vlans |= static_pxv.get(node, {}).get(iface, set())
             vlans |= aaep_by_node.get(node, {}).get(iface, set())
+            if not vlans:
+                continue
+
+            nf = norm_if(iface)
+            if nf.startswith("eth"):
+                phys_vlans[nf] |= vlans
+            else:
+                # Resolve logical (VPC/PC) → physical member ports
+                mem = set()
+                if nf in node_po:
+                    mem |= node_po[nf]
+                if not mem:
+                    lg = norm_agg(nf)
+                    po = node_l2h.get(lg)
+                    if po and po in node_po:
+                        mem |= node_po[po]
+                eth_members = {e for e in mem if e.startswith("eth")}
+                if eth_members:
+                    for eth in eth_members:
+                        phys_vlans[eth] |= vlans
+                else:
+                    unresolved_logical.append((iface, vlans))
+
+        if unresolved_logical and debug:
+            for iface, vlans in unresolved_logical:
+                print(f"  [WARN] No eth members for logical iface '{iface}' on node {node} "
+                      f"({len(vlans)} VLANs) — excluded from PxV.")
+
+        node_data = {}
+        node_total = 0
+
+        for iface in sorted(phys_vlans.keys(), key=if_sort_key):
+            vlans = phys_vlans[iface]
 
             bds = set()
             for vlan in vlans:
@@ -836,12 +883,17 @@ def compute(api, api_data, acc_tree, node_tree, static_pxv, totals_only, ports_o
             print(f"  {sv} -> {sorted(v2bd[sv])}")
         print("======================\n")
 
-    # Compute per-port PxV ONCE for the whole fabric
+    # Compute per-port PxV ONCE for the whole fabric.
+    # po_by_node and l2h_by_node are passed so that logical interfaces
+    # (VPC/PC) are resolved to their physical eth members before PxV is summed,
+    # preventing double-counting of VLANs on both the logical and physical ports.
     per_port_pxv = compute_pxv_per_port(
         static_pxv=static_pxv,
         aaep_pxv=aaep_pxv,
         vlan_to_bd=v2bd,
         bd_l3_map=bd_l3,
+        po_by_node=po_by_node,
+        l2h_by_node=l2h_by_node,
         debug=debug_pxv,
     )
 
