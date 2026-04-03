@@ -128,7 +128,7 @@ def setup_cert(host, user, pwd, domain, cert_name, key_file, verify=False):
 
     # Build a minimal self-signed certificate (10-year validity)
     subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, user)])
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.timezone.utc)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -162,14 +162,38 @@ def setup_cert(host, user, pwd, domain, cert_name, key_file, verify=False):
         sys.exit(1)
     print(f"Logged in as {user}@{domain}")
 
-    # POST the certificate to APIC
-    mo_url = f"{host}/api/node/mo/uni/userext/user-{user}/usercert-{cert_name}.json"
-    cert_payload = {"aaaUserCert": {"attributes": {"name": cert_name, "data": cert_pem}}}
+    # POST the certificate as a child of the aaaUser MO.
+    # Posting to the user DN (not the cert DN) with nested children works for
+    # both pre-existing local users and ensures the user object is created if absent.
+    # Note: APIC cert auth requires a LOCAL user account.  LDAP/remote users (those
+    # whose uni/userext/user-{username} object does not exist) cannot have certs
+    # registered — use the 'aciansible' local service account instead.
+    mo_url = f"{host}/api/node/mo/uni/userext/user-{user}.json"
+    cert_payload = {
+        "aaaUser": {
+            "attributes": {"name": user},
+            "children": [{
+                "aaaUserCert": {"attributes": {"name": cert_name, "data": cert_pem}}
+            }]
+        }
+    }
     r = sess.post(mo_url, json=cert_payload, verify=verify, timeout=20)
     if r.status_code not in (200, 201):
         try:
             err = r.json().get("imdata", [{}])[0].get("error", {}).get("attributes", {})
-            print(f"Certificate registration failed: code={err.get('code')} text={err.get('text')!r}")
+            code = err.get("code"); text = err.get("text", "")
+            print(f"Certificate registration failed: code={code} text={text!r}")
+            if code == "102" or "not found" in text.lower():
+                print()
+                print("  HINT: APIC X.509 cert auth requires a LOCAL user account.")
+                print(f"  The user '{user}' appears to be an LDAP/remote user — no local")
+                print(f"  'uni/userext/user-{user}' object exists in APIC.")
+                print()
+                print("  Solutions:")
+                print("  1. Register the cert under the local service account instead:")
+                print(f"     python PxV.py --env <ENV> --setup-cert --user aciansible \\")
+                print(f"       --key {key_file} --prompt-password")
+                print("  2. Ask an APIC admin to create a local user and add your certificate.")
         except Exception:
             print(f"Certificate registration failed ({r.status_code}): {r.text[:300]!r}")
         sys.exit(1)
