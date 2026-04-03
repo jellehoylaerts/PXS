@@ -1085,7 +1085,7 @@ def parse_args():
     p = argparse.ArgumentParser(prog="aci-pxv", add_help=True)
     p.add_argument("--apic")
     p.add_argument("--env")
-    p.add_argument("--user", default=os.getenv("APIC_USER"))
+    p.add_argument("--user", default=os.getenv("APIC_USER", "aciansible"))
     p.add_argument("--password", default=os.getenv("APIC_PASS"))
     # FIX #11: configurable AAA login domain (was hardcoded as "Telco_Cloud")
     p.add_argument("--domain", default=os.getenv("APIC_DOMAIN", "Telco_Cloud"),
@@ -1096,7 +1096,7 @@ def parse_args():
     p.add_argument("--cert-name", default=os.getenv("APIC_CERT_NAME"),
                    help="Name of the certificate registered in APIC under the user account "
                         "(e.g. 'admin' → DN: uni/userext/user-{user}/usercert-{cert-name}). "
-                        "Required when --key is used.")
+                        "Defaults to the username when --key is used.")
     p.add_argument("--verify", action="store_true")
     p.add_argument("--workers", type=int, default=40, help="Subtree concurrency (default 40)")
     p.add_argument("--subtree-chunk", type=int, default=500,
@@ -1134,16 +1134,29 @@ def main():
     else:
         print("Specify --apic or --env"); sys.exit(1)
 
-    if not a.user: print("Missing --user"); sys.exit(1)
+    # Default user is aciansible; auto-select key when neither password nor key is given
+    user = a.user  # already defaults to "aciansible"
+
+    key_file = a.key
+    if not a.password and not key_file:
+        # Pick key based on whether the target looks like a lab or prod environment
+        target = (a.env or host).lower()
+        if "lab" in target:
+            key_file = "/app/git/rhosp_ansible/pki/aci-ans-dev.key"
+        elif "prod" in target:
+            key_file = "/app/git/rhosp_ansible/pki/aci-ans-prodkey"
+        else:
+            print("Cannot auto-select key: environment name contains neither 'lab' nor 'prod'. "
+                  "Provide --key or --password explicitly."); sys.exit(1)
+        print(f"Auto-selected key: {key_file}")
 
     # Build auth: certificate takes priority over password
     cert_auth = None
-    if a.key:
-        if not a.cert_name:
-            print("--cert-name is required when using --key"); sys.exit(1)
-        cert_dn = f"uni/userext/user-{a.user}/usercert-{a.cert_name}"
+    if key_file:
+        cert_name = a.cert_name or user   # default cert name = username
+        cert_dn = f"uni/userext/user-{user}/usercert-{cert_name}"
         try:
-            cert_auth = APICCertAuth(cert_dn, a.key)
+            cert_auth = APICCertAuth(cert_dn, key_file)
             print(f"Using certificate authentication (cert DN: {cert_dn})")
         except Exception as e:
             print(f"Failed to load certificate key: {e}"); sys.exit(1)
@@ -1155,7 +1168,7 @@ def main():
     class_workers   = min(8, max(4, a.workers // 4))
     subtree_workers = a.workers
     api = APIC(
-        host, a.user, pwd,
+        host, user, pwd,
         domain=a.domain,           # FIX #11
         verify=a.verify,
         http_log=a.http_log,
